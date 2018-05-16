@@ -8,8 +8,10 @@ from bluesky import navdb
 from bluesky.tools.aero import nm, g0
 from vierd import ETA
 
+
 import random
 import numpy as np
+import os
 from collections import deque
 from keras.models import Sequential
 from keras.layers import Dense
@@ -21,8 +23,9 @@ def init_plugin():
     # Addtional initilisation code
     # Pan to waypoint with fixed zoom level and create a random aircraft.
     # Configuration parameters
-    global env, agent, eventmanager, state_size
+    global env, agent, eventmanager, state_size, train_phase
     state_size = 3
+    train_phase = True
     env = Env()
     agent = DQNAgent(state_size,3)
     eventmanager = Eventmanager()
@@ -104,10 +107,8 @@ def train():
     for i in eventmanager.events:
         if env.actnum == 0:
             agent.sta = ETA(agent.acidx) + random.random() * 100
-#            print('STA ', agent.sta)
         next_state, reward, done, prev_state = env.step()
-#        print('state ', next_state)
-#        print('reward ', reward)
+
         next_state = np.reshape(next_state, [1, agent.state_size])
         if env.actnum>0:
             agent.remember(prev_state, agent.action, reward, next_state, done)
@@ -152,15 +153,15 @@ class Env:
         self.ep = 0
         self.fname = './output/log.csv'
 
-        if not os.path.file_exists(self.fname):
+        if not os.path.isfile(self.fname):
             f = open(self.fname, 'w')
-            f.write("Episode;reward;dist;hdg;t;epsilon\n")
+            f.write("Episode;reward;dist;hdg;t;epsilon;target_t\n")
             f.close()
 
         self.reset()
 
+
     def step(self):
-#        print("Step", self.actnum)
         self.actnum += 1
         prev_state = self.state
 
@@ -168,17 +169,23 @@ class Env:
         qdr, dist = qdrdist(traf.lat[self.acidx], traf.lon[self.acidx],
                             traf.ap.route[self.acidx].wplat[-2],
                             traf.ap.route[self.acidx].wplon[-2])
-        t = agent.sta - sim.simt
+        t = agent.sta - ETA(agent.acidx)
+        print('STA {}, ETA {}, t {}'.format(agent.sta, ETA(agent.acidx), t))
         hdg_ref = abs(degto180(qdr - traf.hdg[agent.acidx]))
 #        self.state = np.array([dist, t, hdg_ref,
 #                               traf.tas[agent.acidx]])
-        self.state = np.array([dist, t, hdg_ref])
+        self.state = np.array([dist, t, hdg_ref/180.])
         # Check episode termination
-        if dist<1 or t<-60:
+        if dist<1 or agent.sta-sim.simt<-60:
+            if agent.epsilon > agent.epsilon_min:
+                agent.epsilon *= agent.epsilon_decay
             self.done = True
             env.reset()
 
         reward = self.gen_reward()
+        print('State {}'.format(self.state))
+        print('Reward {}, epsilon {}'.format(reward, agent.epsilon))
+
 
         return self.state, reward, self.done, prev_state
 
@@ -189,17 +196,17 @@ class Env:
         hdg = self.state[2]
         hdg_ref = 60.
 
-        a_dist = -1
-        a_t = -1.
+        a_dist = -0.3
+        a_t = -0.2
         a_hdg = -0.07
-        dist_rew = 2 + a_dist * dist
+
+        dist_rew = 5 + a_dist * dist
+        t_rew = 10 + a_t * abs(t)
 
         if self.done:
-            t_rew = 5 + a_t * abs(t)
             hdg_rew = a_hdg * abs(degto180(hdg_ref - hdg))
 
         else:
-            t_rew = 0
             hdg_rew = 0
 
         self.reward = dist_rew + t_rew + hdg_rew
@@ -207,7 +214,7 @@ class Env:
 
 
     def reset(self):
-        if self.ep%5 == 0 and self.ep!=0:
+        if self.ep%5 == 0 and self.ep!=0 and train_phase:
             agent.save("./output/model{0:05}.hdf5".format(self.ep))
             print("Saving model after {} episodes".format(self.ep))
 
@@ -219,6 +226,7 @@ class Env:
         self.done=False
         print("Episode ", self.ep)
 
+
     def log(self):
         dist = self.state[0]
         t = self.state[1]
@@ -226,8 +234,9 @@ class Env:
         hdg_ref = 60.
         hdg_diff = (degto180(hdg_ref - hdg))
         f = open(self.fname, 'a')
-        self.f.write("{};{};{};{};{}\n".format(self.ep, self.reward, dist, hdg_diff, t, agent.epsilon))
+        f.write("{};{};{};{};{};{};{}\n".format(self.ep, self.reward, dist, hdg_diff, t, agent.epsilon, agent.sta))
         f.close()
+
 
     def act(self, action):
         # Set new heading reference of the aircraft
@@ -237,7 +246,7 @@ class Env:
 class DQNAgent:
     def __init__(self, state_size, action_size):
         self.train = True
-        self.fname = './output/model00190.HDF5' #'model00005.hdf5'
+        self.fname = ''#'./output/run_0.2/model01200.HDF5' #'model00005.hdf5'
         self.acidx = 0
         self.state_size = state_size
         self.action_size = action_size
@@ -245,7 +254,7 @@ class DQNAgent:
         self.gamma = 0.95    # discount rate
         self.epsilon = 1.0  # exploration rate
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.9985
+        self.epsilon_decay = 0.9954
         self.learning_rate = 0.001
         self.batch_size = 32
         self.done = False
@@ -255,10 +264,10 @@ class DQNAgent:
         self.replaysteps = 0
         self.model = self._build_model()
 
-        if self.train and not self.fname=='':
+        if train_phase and not self.fname=='':
             self.load(self.fname)
 #
-        elif not self.train:
+        elif not train_phase:
             self.load(self.fname)
 
         self.targetmodel = self.model
@@ -267,8 +276,8 @@ class DQNAgent:
     def _build_model(self):
         # Neural Net for Deep-Q learning Model
         model = Sequential()
-        model.add(Dense(52, input_dim=self.state_size, activation='relu'))
-        model.add(Dense(52, activation='relu'))
+        model.add(Dense(24, input_dim=self.state_size, activation='relu'))
+        model.add(Dense(24, activation='relu'))
         model.add(Dense(self.action_size, activation='linear'))
         model.compile(loss='mse',
                       optimizer='rmsprop')
@@ -385,8 +394,8 @@ class DQNAgent:
             self.targetmodel = self.model
 
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+#        if self.epsilon > self.epsilon_min:
+#            self.epsilon *= self.epsilon_decay
 
         self.replaysteps += 1
 

@@ -266,8 +266,8 @@ def ETA(acidx):
 #    print('dist2vs ', dist2vs)
 #    print('eta', sim.simt + t_total)
 #    print(' ')
-    print(t_total)
-    return t_total
+#    print(t_total)
+    return t_total[0] + sim.simt
 
 
 def abc(a, b, c):
